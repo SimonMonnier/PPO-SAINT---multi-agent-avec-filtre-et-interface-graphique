@@ -39,10 +39,10 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
 
         # --- Config & Agent ---
-        self.cfg = LiveConfig(side="duel")  # LONG ONLY comme tu le souhaites
+        self.cfg = LiveConfig(side="long")  # LONG ONLY comme tu le souhaites
         self.agent = TradingAgent(self.cfg)
 
-        self.setWindowTitle("Loup Ω – BTCUSD M1 Duel")
+        self.setWindowTitle("Loup Ω – BTCUSD M1 Long")
         self.setMinimumSize(700, 400)
 
         # ---------- Redirection stdout/stderr ----------
@@ -70,7 +70,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(title)
 
         subtitle = QtWidgets.QLabel(
-            "Agent RL en live sur MT5 – Mode Duel, sans TP fixe (SL initial + break-even + trailing)."
+            "Agent RL en live sur MT5 – Mode Long, sans TP fixe (SL initial + break-even + trailing)."
         )
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)

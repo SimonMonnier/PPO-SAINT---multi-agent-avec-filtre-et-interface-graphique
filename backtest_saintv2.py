@@ -5,6 +5,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime
+from collections import deque
 
 import MetaTrader5 as mt5
 import numpy as np
@@ -26,6 +27,9 @@ NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 # Modèles pré-entraînés (best PROFIT ici) — mêmes noms que ton training
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
+
+# ======= CONFIRMATION "5 PROBAS" =======
+CONFIRM_STREAK = 5  # EXACTEMENT 5 signaux consécutifs
 
 
 @dataclass
@@ -77,7 +81,7 @@ class LiveConfig:
     # fréquence d'affichage de progression (en nombre de bougies M1)
     progress_interval_bars: int = 1440  # ~ 1 jour
 
-    date_from: datetime = datetime(2024, 10, 7)
+    date_from: datetime = datetime(2025, 10, 1)
     date_to: Optional[datetime] = None
 
 
@@ -101,6 +105,7 @@ def safe_normalize(X, stats, clip_sigma=5.0):
     # On clip tout à ±5σ → le modèle reste dans sa zone de confort
     z = np.clip(z, -clip_sigma, clip_sigma)
     return z
+
 
 # ============================================================
 # INDICATEURS — IDENTIQUES TRAINING / LIVE ("Loup Ω")
@@ -685,6 +690,11 @@ def run_backtest(cfg: LiveConfig):
     )
     max_dd = 0.0
 
+    # ======= Buffer confirmation (5 signaux consécutifs) =======
+    # Chaque élément : (direction, action_idx, prob)
+    # direction: +1 long, -1 short
+    signal_buffer = deque(maxlen=CONFIRM_STREAK)
+
     n = len(df)
     start_index = cfg.lookback
 
@@ -748,6 +758,9 @@ def run_backtest(cfg: LiveConfig):
                 state.entry_index = -1
                 state.last_risk_scale = 1.0
 
+                # reset buffer après une clôture (on repart propre)
+                signal_buffer.clear()
+
         # 2) Equity & drawdown
         if state.position != 0:
             latent = (
@@ -780,7 +793,8 @@ def run_backtest(cfg: LiveConfig):
                     f"[FILTER LONG] close[-1]={last_close:.2f} < close[-3]*0.9975={close_3*0.9975:.2f} "
                     f"→ pas d'entrée sur cette bougie."
                 )
-                # On ne construit pas l'obs, pas de décision modèle → HOLD
+                # IMPORTANT : on considère ça comme "pas de signal"
+                signal_buffer.clear()
                 continue
         # ===========================================================
 
@@ -799,6 +813,11 @@ def run_backtest(cfg: LiveConfig):
                 s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 thr = cfg.min_confidence
 
+                # ====== (NOUVEAU) : on va aussi sortir p_signal et direction ======
+                a = 4
+                p_signal = 0.0
+                direction = 0  # +1 long, -1 short
+
                 if cfg.side == "duel":
                     if policy_long is None or policy_short is None:
                         a = 4
@@ -810,6 +829,7 @@ def run_backtest(cfg: LiveConfig):
                         logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
                         prob_long_open = torch.softmax(logits_long_m, dim=-1)  # (5,)
                         max_p_long = prob_long_open[:4].max().item()
+                        idx_long = int(torch.argmax(prob_long_open[:4]).item())
 
                         # ----- SHORT -----
                         logits_short, _ = policy_short(s)    # (1,5)
@@ -818,17 +838,20 @@ def run_backtest(cfg: LiveConfig):
                         logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
                         prob_short_open = torch.softmax(logits_short_m, dim=-1)  # (5,)
                         max_p_short = prob_short_open[:4].max().item()
+                        idx_short = int(torch.argmax(prob_short_open[:4]).item())
 
                         if max_p_long >= thr and max_p_long > max_p_short:
-                            idx_long = int(torch.argmax(prob_long_open[:4]).item())
                             if idx_long in (0, 2):
                                 a = idx_long
+                                p_signal = float(max_p_long)
+                                direction = +1
                             else:
                                 a = 4
                         elif max_p_short >= thr:
-                            idx_short = int(torch.argmax(prob_short_open[:4]).item())
                             if idx_short in (1, 3):
                                 a = idx_short
+                                p_signal = float(max_p_short)
+                                direction = -1
                             else:
                                 a = 4
                         else:
@@ -852,6 +875,8 @@ def run_backtest(cfg: LiveConfig):
                             a = 4
                         else:
                             a = a_long
+                            p_signal = p_long
+                            direction = +1  # long only
 
                 elif cfg.side == "short":
                     if policy_short is None:
@@ -871,8 +896,49 @@ def run_backtest(cfg: LiveConfig):
                             a = 4
                         else:
                             a = a_short
+                            p_signal = p_short
+                            direction = -1  # short only
                 else:
                     a = 4
+
+                # ============================================================
+                # (NOUVEAU) CONFIRMATION 5 SIGNES CONSECUTIFS + PROBA CUMULEE
+                # Règle :
+                #  - si a == HOLD → reset buffer
+                #  - sinon on push (direction, a, p_signal)
+                #  - ouverture autorisée uniquement si :
+                #        len(buffer)=5
+                #        même direction sur les 5
+                #        somme(p) >= 5 * cfg.min_confidence
+                # ============================================================
+                if a == 4 or direction == 0:
+                    signal_buffer.clear()
+                else:
+                    signal_buffer.append((direction, a, p_signal))
+
+                    if len(signal_buffer) < CONFIRM_STREAK:
+                        # pas assez de confirmations → HOLD
+                        a = 4
+                    else:
+                        dirs = [d for (d, aa, pp) in signal_buffer]
+                        probs = [pp for (d, aa, pp) in signal_buffer]
+
+                        same_dir = all(d == dirs[0] for d in dirs)
+                        prob_sum = float(sum(probs))
+                        needed = float(CONFIRM_STREAK * cfg.min_confidence)
+
+                        if not same_dir or prob_sum < needed:
+                            # pas confirmé → HOLD
+                            a = 4
+                        else:
+                            # confirmé → on garde la dernière action proposée
+                            direction_last, a_last, p_last = signal_buffer[-1]
+                            a = a_last
+                            # (optionnel log)
+                            print(
+                                f"[CONFIRM {CONFIRM_STREAK}] OK dir={direction_last:+d} "
+                                f"sumP={prob_sum:.4f} >= {needed:.4f} | last_action={a_last} (p={p_last:.4f})"
+                            )
 
             # mapping vers env_action + risk_scale (comme env / live)
             if a == 4:
@@ -913,42 +979,13 @@ def run_backtest(cfg: LiveConfig):
 
                 side_txt = "LONG" if side == 1 else "SHORT"
 
-                # ====== LOG DES PROBABILITÉS D’ACTION ======
-                if cfg.side == "duel":
-                    print("\n--- Probabilités d’action LONG ---")
-                    print(f"BUY1    : {prob_long_open[0].item():.4f}")
-                    print(f"SELL1   : {prob_long_open[1].item():.4f}")
-                    print(f"BUY1.8  : {prob_long_open[2].item():.4f}")
-                    print(f"SELL1.8 : {prob_long_open[3].item():.4f}")
-                    print(f"HOLD    : {prob_long_open[4].item():.4f}")
-
-                    print("--- Probabilités d’action SHORT ---")
-                    print(f"BUY1    : {prob_short_open[0].item():.4f}")
-                    print(f"SELL1   : {prob_short_open[1].item():.4f}")
-                    print(f"BUY1.8  : {prob_short_open[2].item():.4f}")
-                    print(f"SELL1.8 : {prob_short_open[3].item():.4f}")
-                    print(f"HOLD    : {prob_short_open[4].item():.4f}\n")
-
-                elif cfg.side == "long":
-                    print("\n--- Probabilités d’action LONG ---")
-                    print(f"BUY1    : {probs_long[0].item():.4f}")
-                    print(f"SELL1   : {probs_long[1].item():.4f}")
-                    print(f"BUY1.8  : {probs_long[2].item():.4f}")
-                    print(f"SELL1.8 : {probs_long[3].item():.4f}")
-                    print(f"HOLD    : {probs_long[4].item():.4f}\n")
-
-                elif cfg.side == "short":
-                    print("\n--- Probabilités d’action SHORT ---")
-                    print(f"BUY1    : {probs_short[0].item():.4f}")
-                    print(f"SELL1   : {probs_short[1].item():.4f}")
-                    print(f"BUY1.8  : {probs_short[2].item():.4f}")
-                    print(f"SELL1.8 : {probs_short[3].item():.4f}")
-                    print(f"HOLD    : {probs_short[4].item():.4f}\n")
-
                 print(
                     f"[{time_str}] OUVERTURE {side_txt} @ {entry_price:.2f} | vol={volume:.4f} | "
                     f"SL={sl:.2f} | risk_scale={risk_scale:.2f}"
                 )
+
+                # IMPORTANT : après ouverture, on reset le buffer
+                signal_buffer.clear()
 
         # 5) Log de progression périodique
         if ((i - (start_index + 1)) % cfg.progress_interval_bars == 0) or (i == n - 2):

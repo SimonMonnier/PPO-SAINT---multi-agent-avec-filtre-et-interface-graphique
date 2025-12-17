@@ -7,6 +7,7 @@ import threading
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime
+from collections import deque
 
 import MetaTrader5 as mt5
 import numpy as np
@@ -65,7 +66,7 @@ class LiveConfig:
     #   "duel"  : duel long vs short (logique du backtest)
     #   "long"  : uniquement agent LONG (pas de short)
     #   "short" : uniquement agent SHORT (pas de long)
-    side: str = "duel"
+    side: str = "long"
 
     # ======= BREAK-EVEN + TRAILING (en ATR) =======
     breakeven_atr_mult: float = 1.0
@@ -779,6 +780,36 @@ def live_loop(cfg: LiveConfig, should_continue):
     last_bar_time = None
     last_risk_scale = 1.0
 
+    # ===================== CONFIRMATION 5 SIGNAUX (pondérée) =====================
+    CONFIRM_N = 5
+    # on stocke (direction, prob_open) à chaque nouvelle bougie fermée
+    confirm_hist = deque(maxlen=CONFIRM_N)
+
+    def reset_confirmation():
+        confirm_hist.clear()
+
+    def push_confirmation(direction: str, prob_open: float):
+        # direction in {"LONG","SHORT"} ; HOLD/None reset
+        confirm_hist.append((direction, float(prob_open)))
+
+    def is_confirmed(direction: str, thr: float) -> Tuple[bool, float, float]:
+        """
+        Confirmation pondérée par probabilité cumulée:
+          - il faut CONFIRM_N signaux consécutifs dans le même sens
+          - et moyenne des probas d'ouverture >= thr
+        Retour: (ok, avg_prob, sum_prob)
+        """
+        if len(confirm_hist) < CONFIRM_N:
+            return False, 0.0, 0.0
+        dirs = [d for d, _ in confirm_hist]
+        if any(d != direction for d in dirs):
+            return False, 0.0, 0.0
+        probs = [p for _, p in confirm_hist]
+        sum_p = float(sum(probs))
+        avg_p = float(sum_p / len(probs))
+        return (avg_p >= thr), avg_p, sum_p
+    # ============================================================================
+
     try:
         while should_continue():
 
@@ -868,6 +899,7 @@ def live_loop(cfg: LiveConfig, should_continue):
                         f"[FILTER LONG LIVE] close[-1]={last_close:.2f} < "
                         f"close[-3]*0.9975={close_3*0.9975:.2f} → aucun ordre ouvert sur cette bougie."
                     )
+                    reset_confirmation()
                     time.sleep(cfg.poll_interval)
                     continue
             # ============================================================
@@ -880,8 +912,15 @@ def live_loop(cfg: LiveConfig, should_continue):
 
             # ========== DÉCISION DU MODELE ==========
 
+            thr = 0.7  # inchangé
+
             with torch.no_grad():
                 s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+
+                # Pour la confirmation: on extrait le "meilleur signal d'ouverture" (direction + prob)
+                candidate_dir = None
+                candidate_open_prob = 0.0
+                a = 4  # default HOLD
 
                 if cfg.side == "duel":
                     if policy_long is None or policy_short is None:
@@ -908,18 +947,23 @@ def live_loop(cfg: LiveConfig, should_continue):
                         max_p_long = probs_long[:4].max().item()
                         max_p_short = probs_short[:4].max().item()
 
-                        if max_p_long >= 0.7 and max_p_long > max_p_short:
+                        # Candidat brut (comme avant)
+                        if max_p_long >= thr and max_p_long > max_p_short:
                             idx_long = int(torch.argmax(probs_long[:4]).item())
                             print(f"[DUEL] Candidat LONG idx={idx_long}, max_p_long={max_p_long:.3f}")
                             if idx_long in (0, 2):
                                 a = idx_long
+                                candidate_dir = "LONG"
+                                candidate_open_prob = float(max_p_long)
                             else:
                                 a = 4
-                        elif max_p_short >= 0.7:
+                        elif max_p_short >= thr:
                             idx_short = int(torch.argmax(probs_short[:4]).item())
                             print(f"[DUEL] Candidat SHORT idx={idx_short}, max_p_short={max_p_short:.3f}")
                             if idx_short in (1, 3):
                                 a = idx_short
+                                candidate_dir = "SHORT"
+                                candidate_open_prob = float(max_p_short)
                             else:
                                 a = 4
                         else:
@@ -946,11 +990,15 @@ def live_loop(cfg: LiveConfig, should_continue):
 
                         print(f"BEST LONG : action={a_long}, prob={p_long:.3f}")
 
-                        if a_long == 4 or p_long < 0.7:
+                        if a_long == 4 or p_long < thr:
                             print("[LONG] Signal trop faible ou HOLD → HOLD.")
                             a = 4
                         else:
                             a = a_long
+                            # direction long seulement si c'est une action d'ouverture BUY (0/2)
+                            if a_long in (0, 2):
+                                candidate_dir = "LONG"
+                                candidate_open_prob = float(p_long)
 
                 elif cfg.side == "short":
                     if policy_short is None:
@@ -972,14 +1020,47 @@ def live_loop(cfg: LiveConfig, should_continue):
 
                         print(f"BEST SHORT : action={a_short}, prob={p_short:.3f}")
 
-                        if a_short == 4 or p_short < 0.7:
+                        if a_short == 4 or p_short < thr:
                             print("[SHORT] Signal trop faible ou HOLD → HOLD.")
                             a = 4
                         else:
                             a = a_short
+                            # direction short seulement si c'est une action d'ouverture SELL (1/3)
+                            if a_short in (1, 3):
+                                candidate_dir = "SHORT"
+                                candidate_open_prob = float(p_short)
                 else:
                     print(f"cfg.side invalide : {cfg.side}, on HOLD.")
                     a = 4
+
+                # ===================== NOUVELLE CONDITION (5 confirmations pondérées) =====================
+                # - si le candidat n'est pas une entrée (a==HOLD) → reset
+                # - sinon on empile (direction, prob) et on n'ouvre que si confirmé
+                if a == 4 or candidate_dir is None:
+                    print("[CONFIRM] HOLD / pas de direction → reset confirmation.")
+                    reset_confirmation()
+                    a = 4
+                else:
+                    push_confirmation(candidate_dir, candidate_open_prob)
+                    ok, avg_p, sum_p = is_confirmed(candidate_dir, thr)
+
+                    print(
+                        f"[CONFIRM] Ajout signal {candidate_dir} prob={candidate_open_prob:.3f} | "
+                        f"hist={list(confirm_hist)}"
+                    )
+                    print(
+                        f"[CONFIRM] Check {candidate_dir}: "
+                        f"len={len(confirm_hist)}/{CONFIRM_N} | avg_prob={avg_p:.3f} | sum_prob={sum_p:.3f} | ok={ok}"
+                    )
+
+                    if not ok:
+                        print(f"[CONFIRM] Pas encore {CONFIRM_N} confirmations {candidate_dir} pondérées ≥ {thr:.2f} → HOLD.")
+                        a = 4
+                    else:
+                        print(f"[CONFIRM] ✅ {CONFIRM_N} confirmations {candidate_dir} OK (avg_prob={avg_p:.3f}) → autorise ouverture.")
+                        # On reset après validation pour éviter d'ouvrir à chaque bougie suivante
+                        reset_confirmation()
+                # =========================================================================================
 
             print(f"Action finale (0:BUY1,1:SELL1,2:BUY1.8,3:SELL1.8,4:HOLD) : {a}")
 
